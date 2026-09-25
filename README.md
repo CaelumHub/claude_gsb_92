@@ -125,7 +125,8 @@ gsb3/
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/health` | 健康检查 |
-| GET/POST | `/api/users` | 用户列表（分页/搜索/标签过滤）/ 创建 |
+| GET/POST | `/api/users` | 用户列表（分页/搜索/多标签 AND·OR/好友数范围/社群过滤）/ 创建 |
+| POST | `/api/users/batch` | 批量打标签 / 批量设置属性 / 批量删除（服务端原子生效） |
 | GET/PUT/DELETE | `/api/users/<id>` | 用户详情 / 更新 / 删除 |
 | POST | `/api/users/<id>/tags` | 设置用户标签 |
 | POST | `/api/import` | 批量导入边 |

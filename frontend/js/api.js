@@ -64,6 +64,12 @@
     deleteUser: (id) => request("DELETE", "/api/users/" + id),
     setUserTags: (id, tags) => request("POST", "/api/users/" + id + "/tags", { tags }),
 
+    // 批量用户操作（服务端一次性原子生效）
+    // body: { action: "set_tags", ids, tags, mode: add|remove|replace }
+    //       { action: "set_attributes", ids, attributes, mode: merge|replace }
+    //       { action: "delete", ids }
+    batchUsers: (b) => request("POST", "/api/users/batch", b),
+
     // 关系导入
     importEdges: (edges, source) => request("POST", "/api/import", { edges, source }),
 

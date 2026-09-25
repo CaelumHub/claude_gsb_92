@@ -12,8 +12,11 @@ are parsed once and passed through.  Static files are served from
 Endpoint summary (all under ``/api``):
 
     GET    /api/health
-    GET    /api/users                 ?page&size&search&tag
+    GET    /api/users                 ?page&size&search&tag&tags&tag_match
+                                      &min_degree&max_degree&community
     POST   /api/users                 {name, tags, attributes}
+    POST   /api/users/batch           {action: set_tags|set_attributes|delete,
+                                       ids:[...], tags/mode | attributes/mode}
     GET    /api/users/<id>
     PUT    /api/users/<id>            {name?, tags?, attributes?}
     DELETE /api/users/<id>
@@ -53,11 +56,31 @@ from typing import Optional
 
 try:
     from . import config, storage
-    from .service import SocialGraphService
+    from .service import BatchValidationError, SocialGraphService
 except ImportError:  # pragma: no cover
     import config
     import storage
-    from service import SocialGraphService
+    from service import BatchValidationError, SocialGraphService
+
+
+# ---------------------------------------------------------------------------
+# Batch operation dispatch
+# ---------------------------------------------------------------------------
+def _dispatch_batch(service: "SocialGraphService", body: dict) -> dict:
+    """Route ``POST /api/users/batch`` to one of the atomic batch handlers."""
+    action = str(body.get("action", "")).strip()
+    ids = body.get("ids")
+    if action == "set_tags":
+        return service.batch_set_tags(
+            ids, body.get("tags") or [], str(body.get("mode", "add"))
+        )
+    if action == "set_attributes":
+        return service.batch_set_attributes(
+            ids, body.get("attributes") or {}, str(body.get("mode", "merge"))
+        )
+    if action == "delete":
+        return service.batch_delete_users(ids)
+    raise BatchValidationError("未知的批量操作 action（支持 set_tags / set_attributes / delete）")
 
 
 # ---------------------------------------------------------------------------
@@ -115,10 +138,19 @@ class ApiRouter:
         if route == "/users" and method == "GET":
             page = _to_int(query.get("page"), 0)
             size = min(max(_to_int(query.get("size"), 20), 1), 500)
+            tags = [t for t in query.get("tags", "").split(",") if t]
+            min_degree = _to_int(query.get("min_degree"), -1)
+            max_degree = _to_int(query.get("max_degree"), -1)
+            community = _to_int(query.get("community"), -999)
             return 200, self.service.list_users(
                 page=page, size=size,
                 search=query.get("search", ""),
                 tag=query.get("tag", ""),
+                tags=tags,
+                tag_match=query.get("tag_match", "all"),
+                min_degree=min_degree if min_degree >= 0 else None,
+                max_degree=max_degree if max_degree >= 0 else None,
+                community=community if community != -999 else None,
             )
         if route == "/users" and method == "POST":
             b = body or {}
@@ -127,6 +159,13 @@ class ApiRouter:
             attributes = b.get("attributes") or {}
             user = self.service.create_user(name, tags, attributes)
             return 201, user
+
+        # --- batch user operations (must precede the /users/<id> match) ---
+        if route == "/users/batch" and method == "POST":
+            try:
+                return 200, _dispatch_batch(self.service, body or {})
+            except BatchValidationError as exc:
+                return _error(str(exc), 400)
 
         # --- single user ---
         m = re.fullmatch(r"/users/(\d+)", route)

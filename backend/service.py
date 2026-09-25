@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 import threading
 from collections import Counter, defaultdict
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 try:
     from . import algorithms, config, storage
@@ -36,7 +36,14 @@ try:
         shortest_path,
     )
     from .graph import Graph
-    from .storage import DerivedStore, GraphStore, rebuild_index_from_shards
+    from .storage import (
+        DerivedStore,
+        GraphStore,
+        _load_shard,
+        _user_shard,
+        _write_shard,
+        rebuild_index_from_shards,
+    )
 except ImportError:  # pragma: no cover
     import algorithms
     import config
@@ -53,7 +60,18 @@ except ImportError:  # pragma: no cover
         shortest_path,
     )
     from graph import Graph
-    from storage import DerivedStore, GraphStore, rebuild_index_from_shards
+    from storage import (  # type: ignore
+        DerivedStore,
+        GraphStore,
+        _load_shard,
+        _user_shard,
+        _write_shard,
+        rebuild_index_from_shards,
+    )
+
+
+class BatchValidationError(ValueError):
+    """Raised when a batch request is malformed (surfaced as HTTP 400)."""
 
 
 class SocialGraphService:
@@ -123,57 +141,109 @@ class SocialGraphService:
     # ------------------------------------------------------------------
     # Users
     # ------------------------------------------------------------------
-    def list_users(self, page: int = 1, size: int = 20, search: str = "", tag: str = "") -> dict:
-        users = self.store.load_users()
-        items = []
-        for uid, u in users.items():
-            if search:
-                haystack = str(uid)
-                if search not in haystack:
+    def list_users(
+        self,
+        page: int = 1,
+        size: int = 20,
+        search: str = "",
+        tag: str = "",
+        tags: Optional[List[str]] = None,
+        tag_match: str = "all",
+        min_degree: Optional[int] = None,
+        max_degree: Optional[int] = None,
+        community: Optional[int] = None,
+    ) -> dict:
+        """Return a filtered, paginated user page.
+
+        Filters (all AND-combined; tag lists are AND/OR depending on
+        ``tag_match``):
+
+        * ``search``      -- substring match on name or id
+        * ``tag``/``tags`` -- tag membership (legacy single ``tag`` is merged
+          into ``tags``)
+        * ``min_degree`` / ``max_degree`` -- friend-count range (inclusive)
+        * ``community``   -- Louvain community id; ``-1`` means unassigned
+        """
+        with self._lock:
+            users = self.store.load_users()
+            graph = self.get_graph()
+            community_map = self.get_community().get("communities", {})
+            community_map = {int(k): int(v) for k, v in community_map.items()}
+
+            required_tags = list(tags or [])
+            if tag and tag not in required_tags:
+                required_tags.append(tag)
+            required_tags = [t for t in required_tags if t]
+            match_any = tag_match == "any"
+
+            items = []
+            for uid, u in users.items():
+                if search:
+                    if search not in str(u.get("name", "")) and search not in str(uid):
+                        continue
+                user_tags = u.get("tags", [])
+                if required_tags:
+                    if match_any:
+                        if not any(t in user_tags for t in required_tags):
+                            continue
+                    elif not all(t in user_tags for t in required_tags):
+                        continue
+                degree = graph.degree(uid)
+                if min_degree is not None and degree < min_degree:
                     continue
-            if tag:
-                if tag not in u.get("tags", []):
+                if max_degree is not None and degree > max_degree:
                     continue
-            record = {"id": uid}
-            for key, value in u.items():
-                record[key] = value
-            record["uid"] = uid
-            items.append(record)
-        total = len(users)
-        sort_field = config.DEFAULT_USER_SORT
-        items.sort(
-            key=lambda x: (x.get(sort_field, 0), -x["id"]),
-            reverse=True,
-        )
-        start = (page - 1) * size
-        if start < 0:
-            start = 0
-        end = start + size
-        page_out = items[start:end]
-        return {
-            "items": page_out,
-            "total": total,
-            "page": page,
-            "size": size,
-        }
+                if community is not None:
+                    user_comm = community_map.get(uid, -1)
+                    if user_comm != community:
+                        continue
+                record = {"id": uid}
+                for key, value in u.items():
+                    record[key] = value
+                record["uid"] = uid
+                record["degree"] = degree
+                record["community"] = community_map.get(uid, -1)
+                items.append(record)
+
+            # ``total`` counts the filtered hit set so pagination and the UI
+            # header reflect the active filters.
+            total = len(items)
+            sort_field = config.DEFAULT_USER_SORT
+            items.sort(
+                key=lambda x: (
+                    x.get(sort_field, x.get("created_at_ms", 0)) or 0,
+                    -x["id"],
+                ),
+                reverse=True,
+            )
+            start = max((page - 1) * size, 0)
+            page_out = items[start:start + size]
+            return {
+                "items": page_out,
+                "total": total,
+                "page": page,
+                "size": size,
+            }
 
     def get_user(self, uid: int) -> Optional[dict]:
-        users = self.store.load_users()
-        u = users.get(uid)
-        if u is None:
-            return None
-        graph = self.get_graph()
-        neighbors = list(graph.neighbors(uid))
-        result = {"id": uid, **u}
-        result["degree"] = len(neighbors)
-        result["neighbors"] = neighbors[:100]
-        result["neighbor_count"] = len(neighbors)
-        result["communities"] = self._community_of(uid)
-        # 附加单独存储的用户画像（profiles.json）。
-        profile = self.store.load_profiles().get(uid)
-        if profile:
-            result["profile"] = profile
-        return result
+        with self._lock:
+            users = self.store.load_users()
+            u = users.get(uid)
+            if u is None:
+                return None
+            graph = self.get_graph()
+            neighbors = list(graph.neighbors(uid))
+            result = {"id": uid, **u}
+            result["degree"] = len(neighbors)
+            result["neighbors"] = neighbors[:100]
+            result["neighbor_count"] = len(neighbors)
+            result["communities"] = self._community_of(uid)
+            result["community"] = self._community_of(uid)
+            # 附加单独存储的用户画像（profiles.json）。
+            profile = self.store.load_profiles().get(uid)
+            if profile:
+                result["profile"] = profile
+            return result
 
     # ------------------------------------------------------------------
     # User profiles (stored separately from basic records & recommendations)
@@ -217,65 +287,270 @@ class SocialGraphService:
         ]
 
     def create_user(self, name: str, tags: Optional[List[str]] = None, attributes: Optional[dict] = None) -> dict:
-        users = self.store.load_users()
-        uid = max(users.keys(), default=0) + 1
-        user = {
-            "name": name or f"user_{uid}",
-            "tags": tags or [],
-            "attributes": attributes or {},
-            "created_at": config.now_ms(),
-        }
-        users[uid] = user
-        self.store.save_users(users)
-        self._register_tags(tags or [])
-        return {"id": uid, **user}
+        with self._lock:
+            users = self.store.load_users()
+            uid = max(users.keys(), default=0) + 1
+            user = {
+                "name": name or f"user_{uid}",
+                "tags": list(tags or []),
+                "attributes": dict(attributes or {}),
+                "created_at": config.now_ms(),
+            }
+            users[uid] = user
+            self.store.save_users(users)
+            self._register_tags(tags or [])
+            return {"id": uid, **user}
 
     def update_user(self, uid: int, patch: dict) -> Optional[dict]:
-        users = self.store.load_users()
-        if uid not in users:
-            return None
-        u = users[uid]
-        if "name" in patch:
-            u["name"] = patch["name"]
-        if "tags" in patch:
-            u["tags"] = patch["tags"]
-            self._register_tags(patch["tags"])
-        if "attributes" in patch:
-            u["attributes"] = {**u.get("attributes", {}), **patch["attributes"]}
-        self.store.save_users(users)
-        # Invalidate recommendations since tags may change recommendations.
-        self._rec_cache.pop(uid, None)
-        return {"id": uid, **u}
+        with self._lock:
+            users = self.store.load_users()
+            if uid not in users:
+                return None
+            u = users[uid]
+            if "name" in patch:
+                u["name"] = patch["name"]
+            if "tags" in patch:
+                u["tags"] = list(patch["tags"])
+                self._register_tags(patch["tags"])
+            if "attributes" in patch:
+                u["attributes"] = {**u.get("attributes", {}), **patch["attributes"]}
+            self.store.save_users(users)
+            # Invalidate recommendations since tags may change recommendations.
+            self._rec_cache.pop(uid, None)
+            return {"id": uid, **u}
 
     def delete_user(self, uid: int) -> bool:
-        users = self.store.load_users()
-        if uid not in users:
-            return False
-        del users[uid]
-        self.store.save_users(users)
-        # Remove incident edges: rebuild graph without this node.
-        edges = [
-            (u, v, w)
-            for u, v, w in self.store.iter_all_edges()
-            if u != uid and v != uid
-        ]
-        self._rewrite_all_edges(edges)
-        self._rec_cache.pop(uid, None)
-        return True
+        result = self.batch_delete_users([uid])
+        return result["affected"] == 1
+
+    # ------------------------------------------------------------------
+    # Batch user operations
+    # ------------------------------------------------------------------
+    # A batch mutates the user table exactly once and rewrites the graph at
+    # most once; callers additionally hold ``self._lock`` so concurrent
+    # requests cannot interleave and every batch either fully applies or
+    # leaves the data untouched.
+    @staticmethod
+    def _normalise_ids(raw) -> List[int]:
+        if not isinstance(raw, list) or not raw:
+            raise BatchValidationError("ids 必须是非空列表")
+        ids: List[int] = []
+        seen: Set[int] = set()
+        for value in raw:
+            if isinstance(value, bool):
+                raise BatchValidationError("用户 id 必须是整数")
+            try:
+                uid = int(value)
+            except (TypeError, ValueError):
+                raise BatchValidationError(f"非法用户 id: {value!r}")
+            if uid <= 0:
+                raise BatchValidationError(f"非法用户 id: {uid}")
+            if uid not in seen:
+                seen.add(uid)
+                ids.append(uid)
+        if len(ids) > config.BATCH_MAX_USERS:
+            raise BatchValidationError(f"单次批量操作最多 {config.BATCH_MAX_USERS} 个用户")
+        return ids
+
+    def batch_set_tags(self, ids: List[int], tags: List[str], mode: str = "add") -> dict:
+        """Apply a tag change to many users in one atomic write.
+
+        ``mode`` is one of:
+        * ``add``      -- union the tags into each user's tag list
+        * ``remove``   -- strip the tags from each user's tag list
+        * ``replace``  -- overwrite each user's tag list wholesale
+        """
+        ids = self._normalise_ids(ids)
+        if mode not in ("add", "remove", "replace"):
+            raise BatchValidationError("mode 必须是 add / remove / replace")
+        clean_tags = self._clean_tag_list(tags)
+        if mode != "replace" and not clean_tags:
+            # replace 允许传空列表（= 清空标签）；add/remove 必须有目标标签。
+            raise BatchValidationError("标签不能为空")
+        tag_set = set(clean_tags)
+        with self._lock:
+            users = self.store.load_users()
+            missing = [uid for uid in ids if uid not in users]
+            target_ids = [uid for uid in ids if uid in users]
+            touched_tags: Set[str] = set()
+            for uid in target_ids:
+                current = list(users[uid].get("tags", []))
+                if mode == "add":
+                    merged = current + [t for t in clean_tags if t not in current]
+                    touched_tags.update(merged)
+                elif mode == "remove":
+                    merged = [t for t in current if t not in tag_set]
+                else:  # replace
+                    merged = list(clean_tags)
+                    touched_tags.update(merged)
+                users[uid]["tags"] = merged
+            # Single atomic users-file write for the whole batch.
+            self.store.save_users(users)
+            if mode in ("add", "replace") and touched_tags:
+                self._register_tags(sorted(touched_tags))
+            for uid in target_ids:
+                self._rec_cache.pop(uid, None)
+            return {
+                "action": "set_tags",
+                "mode": mode,
+                "requested": len(ids),
+                "affected": len(target_ids),
+                "updated": target_ids,
+                "missing": missing,
+                "tags": clean_tags,
+            }
+
+    def batch_set_attributes(self, ids: List[int], attributes: dict, mode: str = "merge") -> dict:
+        """Set attributes on many users in one atomic write.
+
+        ``mode`` is one of:
+        * ``merge``   -- per-key patch; a value of ``None``/"" deletes that key
+        * ``replace`` -- overwrite the whole attributes object
+        """
+        ids = self._normalise_ids(ids)
+        if mode not in ("merge", "replace"):
+            raise BatchValidationError("mode 必须是 merge / replace")
+        if not isinstance(attributes, dict) or not attributes:
+            raise BatchValidationError("attributes 必须是非空对象")
+        clean_attrs = {}
+        for key, value in attributes.items():
+            key = str(key).strip()
+            if not key:
+                raise BatchValidationError("属性名不能为空")
+            clean_attrs[key] = value
+        with self._lock:
+            users = self.store.load_users()
+            missing = [uid for uid in ids if uid not in users]
+            target_ids = [uid for uid in ids if uid in users]
+            for uid in target_ids:
+                if mode == "replace":
+                    current = {}
+                else:
+                    current = dict(users[uid].get("attributes", {}))
+                for key, value in clean_attrs.items():
+                    if mode == "merge" and (value is None or value == ""):
+                        current.pop(key, None)
+                    else:
+                        current[key] = value
+                users[uid]["attributes"] = current
+            self.store.save_users(users)
+            return {
+                "action": "set_attributes",
+                "mode": mode,
+                "requested": len(ids),
+                "affected": len(target_ids),
+                "updated": target_ids,
+                "missing": missing,
+                "attributes": clean_attrs,
+            }
+
+    def batch_delete_users(self, ids: List[int]) -> dict:
+        """Delete many users and every incident edge in one atomic batch."""
+        ids = self._normalise_ids(ids)
+        id_set = set(ids)
+        with self._lock:
+            users = self.store.load_users()
+            missing = [uid for uid in ids if uid not in users]
+            target_ids = [uid for uid in ids if uid in users]
+            if not target_ids:
+                return {
+                    "action": "delete",
+                    "requested": len(ids),
+                    "affected": 0,
+                    "deleted": [],
+                    "missing": missing,
+                    "edges_removed": 0,
+                }
+            # One users-file write ...
+            for uid in target_ids:
+                del users[uid]
+            self.store.save_users(users)
+            # ... plus one canonical graph rewrite dropping incident edges.
+            previous_edges = self._count_graph_edges()
+            surviving = [
+                (u, v, w)
+                for u, v, w in self.store.iter_all_edges()
+                if u not in id_set and v not in id_set
+            ]
+            self._rewrite_graph_safe(surviving)
+            for uid in target_ids:
+                self._rec_cache.pop(uid, None)
+            return {
+                "action": "delete",
+                "requested": len(ids),
+                "affected": len(target_ids),
+                "deleted": target_ids,
+                "missing": missing,
+                "edges_removed": max(previous_edges - len(surviving), 0),
+            }
+
+    @staticmethod
+    def _clean_tag_list(raw) -> List[str]:
+        if not isinstance(raw, list):
+            raise BatchValidationError("tags 必须是列表")
+        out: List[str] = []
+        for t in raw:
+            t = str(t).strip()
+            if t and t not in out:
+                out.append(t)
+        return out
+
+    @staticmethod
+    def _count_graph_edges() -> int:
+        return sum(
+            len(_load_shard(sid)["edges"])
+            for sid in range(config.SHARD_COUNT)
+        )
+
+    # ------------------------------------------------------------------
+    # Graph rewrite
+    # ------------------------------------------------------------------
+    def _rewrite_graph_safe(self, edges: Iterable[Tuple[int, int, float]]) -> None:
+        """Rewrite every shard from ``edges`` without any unguarded window.
+
+        Each shard file is replaced atomically (temp file + ``os.replace``);
+        shards that no longer carry any edge are deleted only *after* the new
+        graph is fully on disk, so a crash can never lose edges that belong in
+        the new graph.
+        """
+        pending: Dict[int, List[Tuple[int, int, float]]] = defaultdict(list)
+        for u, v, w in edges:
+            pending[_user_shard(int(u))].append((int(u), int(v), float(w)))
+        ts = config.now_ms()
+        old_shards = {
+            sid
+            for sid in range(config.SHARD_COUNT)
+            if os.path.exists(storage._shard_path(sid))
+        }
+        for shard_id, shard_edges in pending.items():
+            shard_edges.sort(key=lambda e: (e[0], e[1]))
+            users_map: Dict[str, dict] = {}
+            payload_edges = []
+            for u, v, w in shard_edges:
+                payload_edges.append([u, v, w, ts])
+                users_map.setdefault(str(u), {"name": str(u)})
+                users_map.setdefault(str(v), {"name": str(v)})
+            _write_shard(shard_id, {
+                "version": 1,
+                "users": users_map,
+                "edges": payload_edges,
+            })
+        # Empty shards disappear after the new graph is fully on disk.
+        for shard_id in old_shards - set(pending):
+            try:
+                os.remove(storage._shard_path(shard_id))
+            except OSError:
+                pass
+        rebuild_index_from_shards()
+        self.invalidate_graph()
 
     def _rewrite_all_edges(self, edges) -> None:
         """Rewrites the entire graph from a list of edges (used by delete)."""
-        self._full_rewrite(edges)
+        self._rewrite_graph_safe(edges)
 
     def _full_rewrite(self, edges) -> None:
-        # Clear existing shards then write fresh canonical shards.
-        for shard_id in range(config.SHARD_COUNT):
-            path = storage._shard_path(shard_id)
-            if os.path.exists(path):
-                os.remove(path)
-        self.store.import_edges(edges)
-        rebuild_index_from_shards()
-        self.invalidate_graph()
+        # Retained for compatibility with older callers.
+        self._rewrite_graph_safe(edges)
 
     # ------------------------------------------------------------------
     # Tags
@@ -395,9 +670,10 @@ class SocialGraphService:
         communities = comm.get("communities", {})
         if not communities:
             return -1
+        # Keys may be ints (in-memory cache) or strings (loaded JSON).
         if uid in communities:
-            return communities[uid]
-        return -1
+            return int(communities[uid])
+        return int(communities.get(str(uid), -1))
 
     def compute_pagerank(self, top: int = 20, force: bool = False) -> dict:
         with self._lock:

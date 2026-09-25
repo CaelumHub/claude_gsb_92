@@ -15,7 +15,7 @@
         <div class="page-head">
           <div>
             <h1>用户管理</h1>
-            <p class="desc">管理用户档案与画像。标签用于推荐冷启动，属性可扩展任意字段。</p>
+            <p class="desc">管理用户档案与画像。支持多选批量打标签、批量设置属性、批量删除，以及好友数 / 社群 / 多标签组合筛选。</p>
           </div>
           <div class="actions">
             <button class="btn btn-primary" id="btnNew">＋ 新建用户</button>
@@ -24,18 +24,47 @@
         </div>
 
         <div class="card">
-          <div class="row wrap">
+          <div class="row wrap" style="gap:10px">
             <div class="input-group" style="flex:1;min-width:220px">
               <input class="input" id="search" placeholder="搜索姓名或 ID…">
-              <select class="select" id="tagFilter" style="max-width:150px">
-                <option value="">全部标签</option>
+            </div>
+            <div class="row" style="gap:6px">
+              <span class="small muted">好友数</span>
+              <input class="input" id="minDegree" type="number" min="0" placeholder="最少" style="width:84px">
+              <span class="faint">–</span>
+              <input class="input" id="maxDegree" type="number" min="0" placeholder="最多" style="width:84px">
+            </div>
+            <select class="select" id="communityFilter" style="max-width:170px">
+              <option value="">全部社群</option>
+            </select>
+            <button class="btn btn-primary" id="btnSearch">筛选</button>
+            <button class="btn btn-ghost" id="btnReset">重置</button>
+          </div>
+          <div class="row wrap mt-8" style="gap:6px 16px">
+            <div class="row" style="gap:8px">
+              <span class="small muted">标签命中</span>
+              <select class="select btn-sm" id="tagMatch" style="max-width:150px">
+                <option value="all">同时满足（AND）</option>
+                <option value="any">任一满足（OR）</option>
               </select>
             </div>
-            <button class="btn" id="btnSearch">搜索</button>
+            <div id="tagFilterBox" class="tag-pick"></div>
           </div>
         </div>
 
         <div class="card mt-16">
+          <div class="batch-bar" id="batchBar" hidden>
+            <div class="row" style="gap:10px">
+              <strong id="selCount">已选 0 人</strong>
+              <button class="btn btn-sm" id="btnSelectAllHits">选择全部筛选结果</button>
+              <button class="btn btn-sm btn-ghost" id="btnClearSel">清空选择</button>
+            </div>
+            <div class="row" style="gap:8px">
+              <button class="btn btn-sm btn-primary" id="btnBatchTags">批量打标签</button>
+              <button class="btn btn-sm" id="btnBatchAttrs">批量设置属性</button>
+              <button class="btn btn-sm btn-danger" id="btnBatchDelete">批量删除</button>
+            </div>
+          </div>
           <div class="card-head">
             <div class="card-title">用户列表 <span class="sub" id="totalInfo"></span></div>
           </div>
@@ -50,47 +79,161 @@
   <script src="js/common.js"></script>
   <script>
     const C = common;
-    let state = { page: 1, size: 12, total: 0, search: "", tag: "" };
+    const state = {
+      page: 1, size: 12, total: 0,
+      search: "", tags: [], tagMatch: "all",
+      minDegree: "", maxDegree: "", community: "",
+    };
+    // 跨分页保留的勾选集合（用户 id）
+    let selected = new Set();
+    let allTags = [];
+    let communities = []; // [{id,size}]
+
+    // ----------------------------------------------------------------
+    // 筛选参数
+    // ----------------------------------------------------------------
+    function buildParams() {
+      const p = { page: state.page, size: state.size };
+      if (state.search) p.search = state.search;
+      if (state.tags.length) p.tags = state.tags.join(",");
+      if (state.tags.length > 1) p.tag_match = state.tagMatch;
+      if (state.minDegree !== "") p.min_degree = state.minDegree;
+      if (state.maxDegree !== "") p.max_degree = state.maxDegree;
+      if (state.community !== "") p.community = state.community;
+      return p;
+    }
+
+    function readFiltersFromForm() {
+      state.search = document.getElementById("search").value.trim();
+      state.tagMatch = document.getElementById("tagMatch").value;
+      state.minDegree = document.getElementById("minDegree").value.trim();
+      state.maxDegree = document.getElementById("maxDegree").value.trim();
+      state.community = document.getElementById("communityFilter").value;
+      state.tags = Array.from(document.querySelectorAll("#tagFilterBox input[type=checkbox]:checked")).map((c) => c.value);
+    }
+
+    function renderTagFilterBox() {
+      const box = document.getElementById("tagFilterBox");
+      box.innerHTML = allTags.map((t) =>
+        '<label class="tag-chk"><input type="checkbox" value="' + C.escapeHtml(t.name) + '"' +
+        (state.tags.includes(t.name) ? " checked" : "") + "> " + C.escapeHtml(t.name) + "</label>"
+      ).join("");
+    }
 
     function loadTags() {
-      api.tags().then((d) => {
-        const sel = document.getElementById("tagFilter");
-        const cur = sel.value;
-        sel.innerHTML = '<option value="">全部标签</option>';
-        (d.tags || []).forEach((t) => {
-          const o = document.createElement("option");
-          o.value = t.name; o.textContent = t.name + " (" + t.count + ")";
-          sel.appendChild(o);
-        });
-        sel.value = cur;
+      return api.tags().then((d) => {
+        allTags = (d.tags || []).filter((t) => t.name !== "默认");
+        renderTagFilterBox();
       }).catch((e) => C.toast(e.message, "error"));
     }
 
+    function loadCommunities() {
+      return api.community().then((d) => {
+        const map = d.communities || {};
+        const sizes = {};
+        Object.values(map).forEach((c) => { sizes[c] = (sizes[c] || 0) + 1; });
+        communities = Object.keys(sizes).map(Number).sort((a, b) => a - b);
+        const sel = document.getElementById("communityFilter");
+        const cur = sel.value;
+        sel.innerHTML =
+          '<option value="">全部社群</option>' +
+          '<option value="-1">未分配社群</option>' +
+          communities.map((c) =>
+            '<option value="' + c + '">社群 #' + c + "（" + sizes[c] + " 人）</option>"
+          ).join("");
+        sel.value = cur;
+      }).catch(() => {});
+    }
+
+    // ----------------------------------------------------------------
+    // 列表
+    // ----------------------------------------------------------------
     function loadUsers() {
       const box = document.getElementById("userTable");
       box.innerHTML = C.spinner();
-      api.listUsers({ page: state.page, size: state.size, search: state.search, tag: state.tag })
+      api.listUsers(buildParams())
         .then((d) => {
           state.total = d.total;
-          document.getElementById("totalInfo").textContent = "共 " + d.total + " 人";
-          C.renderTable(box, [
-            { key: "id", label: "ID", align: "right", render: (r) => '<span class="mono">' + r.id + "</span>" },
-            { key: "name", label: "姓名", render: (r) => "<strong>" + C.escapeHtml(r.name) + "</strong>" },
-            { key: "tags", label: "标签", render: (r) => (r.tags || []).map((t) => '<span class="tag">' + C.escapeHtml(t) + "</span>").join(" ") || '<span class="faint">—</span>' },
-            { key: "degree", label: "好友数", align: "right", render: (r) => '<span class="mono">' + (r.degree != null ? r.degree : "—") + "</span>" },
-            { key: "city", label: "城市", render: (r) => C.escapeHtml((r.attributes || {}).city || "—") },
-            { key: "actions", label: "操作", render: (r) =>
-              '<button class="btn btn-sm" onclick="editUser(' + r.id + ')">编辑</button> ' +
-              '<button class="btn btn-sm btn-ghost" onclick="viewUser(' + r.id + ')">详情</button> ' +
-              '<button class="btn btn-sm btn-danger" onclick="delUser(' + r.id + ')">删除</button>' },
-          ], d.items);
-          renderPager();
+          document.getElementById("totalInfo").textContent =
+            "共 " + d.total + " 人" + (selected.size ? " · 已选 " + selected.size + " 人" : "");
+          renderTable(d.items);
+          renderPager(d);
+          renderBatchBar();
         })
         .catch((e) => { box.innerHTML = C.emptyState("⚠", e.message); });
     }
 
-    function renderPager() {
-      const totalPages = Math.max(1, Math.ceil(state.total / state.size));
+    function renderTable(items) {
+      const box = document.getElementById("userTable");
+      const cols = ["", "ID", "姓名", "标签", "好友数", "社群", "城市", "操作"];
+      let html = '<div class="table-wrap"><table class="table"><thead><tr>';
+      html +=
+        '<th style="width:34px"><input type="checkbox" id="chkAll" title="勾选本页"></th>' +
+        "<th>ID</th><th>姓名</th><th>标签</th>" +
+        '<th style="text-align:right">好友数</th><th>社群</th><th>城市</th><th>操作</th>';
+      html += "</tr></thead><tbody>";
+      if (!items.length) {
+        html += '<tr><td colspan="8" style="text-align:center;color:var(--text-faint);padding:30px">暂无符合条件的数据</td></tr>';
+      } else {
+        for (const r of items) {
+          const tags = (r.tags || []).map((t) =>
+            '<span class="tag">' + C.escapeHtml(t) + "</span>"
+          ).join(" ") || '<span class="faint">—</span>';
+          const comm = r.community != null && r.community >= 0
+            ? '<span class="badge info">#' + r.community + "</span>"
+            : '<span class="faint">—</span>';
+          html +=
+            "<tr" + (selected.has(r.id) ? ' class="row-selected"' : "") + ">" +
+            '<td><input type="checkbox" class="chk-row" data-id="' + r.id + '"' +
+            (selected.has(r.id) ? " checked" : "") + "></td>" +
+            '<td><span class="mono">' + r.id + "</span></td>" +
+            "<td><strong>" + C.escapeHtml(r.name) + "</strong></td>" +
+            "<td>" + tags + "</td>" +
+            '<td style="text-align:right"><span class="mono">' + (r.degree != null ? r.degree : "—") + "</span></td>" +
+            "<td>" + comm + "</td>" +
+            "<td>" + C.escapeHtml((r.attributes || {}).city || "—") + "</td>" +
+            "<td>" +
+              '<button class="btn btn-sm" onclick="editUser(' + r.id + ')">编辑</button> ' +
+              '<button class="btn btn-sm btn-ghost" onclick="viewUser(' + r.id + ')">详情</button> ' +
+              '<button class="btn btn-sm btn-danger" onclick="delUser(' + r.id + ')">删除</button>' +
+            "</td></tr>";
+        }
+      }
+      html += "</tbody></table></div>";
+      box.innerHTML = html;
+
+      // 行勾选：事件委托
+      box.querySelectorAll(".chk-row").forEach((chk) => {
+        chk.addEventListener("change", () => {
+          const id = Number(chk.dataset.id);
+          if (chk.checked) selected.add(id); else selected.delete(id);
+          chk.closest("tr").classList.toggle("row-selected", chk.checked);
+          syncHeadCheckbox(items);
+          renderBatchBar();
+          document.getElementById("totalInfo").textContent =
+            "共 " + state.total + " 人" + (selected.size ? " · 已选 " + selected.size + " 人" : "");
+        });
+      });
+      const head = document.getElementById("chkAll");
+      if (head) {
+        head.addEventListener("change", () => {
+          items.forEach((r) => head.checked ? selected.add(r.id) : selected.delete(r.id));
+          loadUsers();
+        });
+        syncHeadCheckbox(items);
+      }
+    }
+
+    function syncHeadCheckbox(items) {
+      const head = document.getElementById("chkAll");
+      if (!head || !items.length) return;
+      const picked = items.filter((r) => selected.has(r.id)).length;
+      head.checked = picked === items.length;
+      head.indeterminate = picked > 0 && picked < items.length;
+    }
+
+    function renderPager(d) {
+      const totalPages = Math.max(1, Math.ceil(d.total / state.size));
       const p = document.getElementById("pager");
       p.innerHTML =
         '<span class="page-info">第 ' + state.page + " / " + totalPages + " 页</span>" +
@@ -100,14 +243,147 @@
 
     window.goPage = (p) => { state.page = p; loadUsers(); };
 
+    // ----------------------------------------------------------------
+    // 批量操作条
+    // ----------------------------------------------------------------
+    function renderBatchBar() {
+      const bar = document.getElementById("batchBar");
+      bar.hidden = selected.size === 0;
+      document.getElementById("selCount").textContent = "已选 " + selected.size + " 人";
+      // 筛选结果多于当前页时才需要“选择全部筛选结果”
+      document.getElementById("btnSelectAllHits").style.display =
+        state.total > selected.size ? "" : "none";
+    }
+
+    function selectedIds() { return Array.from(selected).sort((a, b) => a - b); }
+
+    async function selectAllHits() {
+      // 服务端一次性返回全部命中 id（上限 500），保证“选择全部”与筛选条件严格一致
+      const p = buildParams();
+      p.page = 1; p.size = 500;
+      try {
+        const d = await api.listUsers(p);
+        selected = new Set(d.items.map((r) => r.id));
+        if (d.total > 500) C.toast("命中超过 500 人，已选择前 500 人", "warning");
+        loadUsers();
+      } catch (e) { C.toast(e.message, "error"); }
+    }
+
+    // ---- 批量打标签 --------------------------------------------------
+    async function batchTags() {
+      const n = selected.size;
+      const tagOpts =
+        '<div id="batchTagBox" class="tag-pick">' +
+        allTags.map((t) =>
+          '<label class="tag-chk"><input type="checkbox" value="' + C.escapeHtml(t.name) + '"> ' +
+          C.escapeHtml(t.name) + "</label>"
+        ).join("") + "</div>";
+      const body =
+        '<div class="field-group"><label class="field">操作方式</label>' +
+        '<label class="row" style="padding:2px 0"><input type="radio" name="tagMode" value="add" checked> 追加标签（保留原有标签）</label>' +
+        '<label class="row" style="padding:2px 0"><input type="radio" name="tagMode" value="remove"> 移除标签</label>' +
+        '<label class="row" style="padding:2px 0"><input type="radio" name="tagMode" value="replace"> 替换标签（清空后重设）</label></div>' +
+        '<div class="field-group"><label class="field">标签</label>' + tagOpts + "</div>" +
+        '<p class="small muted">将对已选中的 <strong>' + n + "</strong> 个用户生效。</p>";
+      const idx = await C.modal("批量打标签", body, [
+        { label: "取消", cls: "btn-ghost" },
+        { label: "应用到 " + n + " 人", cls: "btn-primary" },
+      ]);
+      if (idx !== 1) return;
+      const mode = document.querySelector('input[name="tagMode"]:checked').value;
+      const tags = Array.from(document.querySelectorAll("#batchTagBox input[type=checkbox]:checked")).map((c) => c.value);
+      if (!tags.length) { C.toast("请至少选择一个标签", "warning"); return; }
+      // 明确确认：替换模式影响面大，二次确认
+      if (mode === "replace") {
+        const ok = await C.confirmDialog("替换模式会清空这 " + n + " 个用户的全部原有标签，确定继续？");
+        if (!ok) return;
+      }
+      try {
+        const r = await api.batchUsers({ action: "set_tags", ids: selectedIds(), tags, mode });
+        reportBatch("标签更新", r);
+        selected.clear();
+        await Promise.all([loadTags(), loadUsers()]);
+      } catch (e) { C.toast(e.message, "error"); }
+    }
+
+    // ---- 批量设置属性 ------------------------------------------------
+    async function batchAttrs() {
+      const n = selected.size;
+      const body =
+        '<div class="field-group"><label class="field">操作方式</label>' +
+        '<label class="row" style="padding:2px 0"><input type="radio" name="attrMode" value="merge" checked> 合并更新（保留其他属性，留空字段删除）</label>' +
+        '<label class="row" style="padding:2px 0"><input type="radio" name="attrMode" value="replace"> 整体替换（清空后重设）</label></div>' +
+        '<div class="field-group"><label class="field">属性名</label><input class="input" id="bAttrKey" placeholder="例如 city / age / vip"></div>' +
+        '<div class="field-group"><label class="field">属性值（留空 = 删除该属性）</label><input class="input" id="bAttrVal" placeholder="例如 杭州 / 30 / true"></div>' +
+        '<p class="small muted">将对已选中的 <strong>' + n + "</strong> 个用户生效，一次设置一个属性字段。</p>";
+      const idx = await C.modal("批量设置属性", body, [
+        { label: "取消", cls: "btn-ghost" },
+        { label: "应用到 " + n + " 人", cls: "btn-primary" },
+      ]);
+      if (idx !== 1) return;
+      const mode = document.querySelector('input[name="attrMode"]:checked').value;
+      const key = document.getElementById("bAttrKey").value.trim();
+      if (!key) { C.toast("属性名不能为空", "warning"); return; }
+      let raw = document.getElementById("bAttrVal").value.trim();
+      let value;
+      if (raw === "") value = null;
+      else if (/^-?\d+$/.test(raw)) value = Number(raw);
+      else if (raw === "true") value = true;
+      else if (raw === "false") value = false;
+      else value = raw;
+      if (mode === "replace") {
+        const ok = await C.confirmDialog("整体替换会清空这 " + n + " 个用户的全部原有属性，确定继续？");
+        if (!ok) return;
+      }
+      try {
+        const r = await api.batchUsers({
+          action: "set_attributes", ids: selectedIds(),
+          attributes: { [key]: value }, mode,
+        });
+        reportBatch("属性更新", r);
+        selected.clear();
+        loadUsers();
+      } catch (e) { C.toast(e.message, "error"); }
+    }
+
+    // ---- 批量删除 ----------------------------------------------------
+    async function batchDelete() {
+      const n = selected.size;
+      const ok = await C.confirmDialog(
+        "确定删除选中的 " + n + " 个用户吗？其档案与所有关系边将一并删除，此操作不可撤销。"
+      );
+      if (!ok) return;
+      try {
+        const r = await api.batchUsers({ action: "delete", ids: selectedIds() });
+        reportBatch("删除", r);
+        selected.clear();
+        // 删除后当前页可能变空，回退一页
+        const totalPages = Math.max(1, Math.ceil(Math.max(state.total - (r.affected || 0), 0) / state.size));
+        if (state.page > totalPages) state.page = totalPages;
+        loadUsers();
+      } catch (e) { C.toast(e.message, "error"); }
+    }
+
+    function reportBatch(label, r) {
+      let msg = label + "完成：成功 " + r.affected + " 人";
+      if (r.missing && r.missing.length) msg += "，" + r.missing.length + " 人不存在已跳过";
+      if (r.action === "delete" && r.edges_removed != null) msg += "，删除关系边 " + r.edges_removed + " 条";
+      C.toast(msg, r.affected ? "success" : "warning");
+    }
+
+    // ----------------------------------------------------------------
+    // 单用户操作（与原有 CRUD 完全兼容）
+    // ----------------------------------------------------------------
     async function editUser(id) {
       let u = null;
       try { u = await api.getUser(id); } catch (e) { C.toast(e.message, "error"); return; }
       const tags = await api.tags().catch(() => ({ tags: [] }));
-      const tagOpts = tags.tags.map((t) =>
-        '<label class="row" style="padding:2px 0"><input type="checkbox" value="' + C.escapeHtml(t.name) + '" ' +
-        ((u.tags || []).includes(t.name) ? "checked" : "") + '> ' + C.escapeHtml(t.name) + "</label>"
-      ).join("");
+      const tagOpts =
+        '<div id="editTagBox">' +
+        tags.tags.map((t) =>
+          '<label class="row" style="padding:2px 0"><input type="checkbox" value="' + C.escapeHtml(t.name) + '" ' +
+          ((u.tags || []).includes(t.name) ? "checked" : "") + "> " + C.escapeHtml(t.name) + "</label>"
+        ).join("") + "</div>";
       const body =
         '<div class="field-group"><label class="field">姓名</label><input class="input" id="mName" value="' + C.escapeHtml(u.name) + '"></div>' +
         '<div class="field-group"><label class="field">城市</label><input class="input" id="mCity" value="' + C.escapeHtml((u.attributes || {}).city || "") + '"></div>' +
@@ -120,12 +396,13 @@
       const name = document.getElementById("mName").value.trim();
       const city = document.getElementById("mCity").value.trim();
       const age = parseInt(document.getElementById("mAge").value, 10) || 0;
-      const selectedTags = Array.from(document.querySelectorAll('input[type="checkbox"]:checked')).map((c) => c.value);
+      const selectedTags = Array.from(document.querySelectorAll('#editTagBox input[type="checkbox"]:checked')).map((c) => c.value);
       try {
         await api.updateUser(id, {
           name, tags: selectedTags, attributes: { city, age },
         });
         C.toast("已保存用户 #" + id, "success");
+        await loadTags();
         loadUsers();
       } catch (e) { C.toast(e.message, "error"); }
     }
@@ -139,6 +416,7 @@
           '<div class="row spread"><strong>ID</strong><span class="mono">' + u.id + "</span></div>" +
           '<div class="row spread mt-8"><strong>姓名</strong><span>' + C.escapeHtml(u.name) + "</span></div>" +
           '<div class="row spread mt-8"><strong>好友数</strong><span>' + u.degree + "</span></div>" +
+          '<div class="row spread mt-8"><strong>社群</strong><span>#' + (u.community != null ? u.community : -1) + "</span></div>" +
           '<div class="row spread mt-8"><strong>标签</strong><span>' + (u.tags || []).map((t) => '<span class="tag">' + C.escapeHtml(t) + "</span>").join(" ") + "</span></div>" +
           '<div class="mt-8"><strong>属性</strong><div class="mt-8">' + attrs + "</div></div>" +
           '<div class="mt-8"><strong>邻居（前 20）</strong><div class="mt-8 row wrap">' + nbs + "</div></div>";
@@ -154,6 +432,7 @@
       if (!ok) return;
       try {
         await api.deleteUser(id);
+        selected.delete(id);
         C.toast("已删除用户 #" + id, "success");
         loadUsers();
       } catch (e) { C.toast(e.message, "error"); }
@@ -162,9 +441,11 @@
 
     async function newUser() {
       const tags = await api.tags().catch(() => ({ tags: [] }));
-      const tagOpts = tags.tags.map((t) =>
-        '<label class="row" style="padding:2px 0"><input type="checkbox" value="' + C.escapeHtml(t.name) + '"> ' + C.escapeHtml(t.name) + "</label>"
-      ).join("");
+      const tagOpts =
+        '<div id="newTagBox">' +
+        tags.tags.map((t) =>
+          '<label class="row" style="padding:2px 0"><input type="checkbox" value="' + C.escapeHtml(t.name) + '"> ' + C.escapeHtml(t.name) + "</label>"
+        ).join("") + "</div>";
       const body =
         '<div class="field-group"><label class="field">姓名</label><input class="input" id="mName"></div>' +
         '<div class="field-group"><label class="field">城市</label><input class="input" id="mCity"></div>' +
@@ -178,26 +459,48 @@
       if (!name) { C.toast("姓名不能为空", "warning"); return; }
       const city = document.getElementById("mCity").value.trim();
       const age = parseInt(document.getElementById("mAge").value, 10) || 0;
-      const selectedTags = Array.from(document.querySelectorAll('input[type="checkbox"]:checked')).map((c) => c.value);
+      const selectedTags = Array.from(document.querySelectorAll('#newTagBox input[type="checkbox"]:checked')).map((c) => c.value);
       try {
         const u = await api.createUser({ name, tags: selectedTags, attributes: { city, age } });
         C.toast("已创建用户 #" + u.id, "success");
+        await loadTags();
         loadUsers();
       } catch (e) { C.toast(e.message, "error"); }
     }
 
     C.initPage("users", function () {
       document.getElementById("btnNew").addEventListener("click", newUser);
-      document.getElementById("btnRefresh").addEventListener("click", loadUsers);
+      document.getElementById("btnRefresh").addEventListener("click", () => { selected.clear(); loadUsers(); });
       document.getElementById("btnSearch").addEventListener("click", () => {
-        state.search = document.getElementById("search").value.trim();
-        state.tag = document.getElementById("tagFilter").value;
+        readFiltersFromForm();
+        if (state.minDegree !== "" && state.maxDegree !== "" &&
+            Number(state.minDegree) > Number(state.maxDegree)) {
+          C.toast("好友数范围无效：最小值大于最大值", "warning"); return;
+        }
+        state.page = 1;
+        loadUsers();
+      });
+      document.getElementById("btnReset").addEventListener("click", () => {
+        state.search = ""; state.tags = []; state.tagMatch = "all";
+        state.minDegree = ""; state.maxDegree = ""; state.community = "";
+        document.getElementById("search").value = "";
+        document.getElementById("minDegree").value = "";
+        document.getElementById("maxDegree").value = "";
+        document.getElementById("communityFilter").value = "";
+        document.getElementById("tagMatch").value = "all";
+        renderTagFilterBox();
         state.page = 1;
         loadUsers();
       });
       document.getElementById("search").addEventListener("keyup", (e) => { if (e.key === "Enter") document.getElementById("btnSearch").click(); });
-      loadTags();
-      loadUsers();
+
+      document.getElementById("btnBatchTags").addEventListener("click", batchTags);
+      document.getElementById("btnBatchAttrs").addEventListener("click", batchAttrs);
+      document.getElementById("btnBatchDelete").addEventListener("click", batchDelete);
+      document.getElementById("btnClearSel").addEventListener("click", () => { selected.clear(); loadUsers(); });
+      document.getElementById("btnSelectAllHits").addEventListener("click", selectAllHits);
+
+      loadTags().then(loadCommunities).then(loadUsers);
     });
   </script>
 </body>
