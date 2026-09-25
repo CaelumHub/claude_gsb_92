@@ -123,33 +123,110 @@ class SocialGraphService:
     # ------------------------------------------------------------------
     # Users
     # ------------------------------------------------------------------
-    def list_users(self, page: int = 1, size: int = 20, search: str = "", tag: str = "") -> dict:
+    def list_users(
+        self,
+        page: int = 1,
+        size: int = 20,
+        search: str = "",
+        tag: str = "",
+        tags: Optional[List[str]] = None,
+        tag_match: str = "and",
+        min_degree: Optional[int] = None,
+        max_degree: Optional[int] = None,
+        community: Optional[int] = None,
+        ids_only: bool = False,
+    ) -> dict:
+        """List users with combinatorial filters.
+
+        Filters (all optional, combined with AND):
+        * ``search``   -- substring of name or id
+        * ``tag``      -- single-tag filter (kept for backwards compatibility)
+        * ``tags``     -- multiple tags; ``tag_match`` is ``"and"`` (user must
+          carry every tag) or ``"or"`` (any tag hits)
+        * ``min_degree`` / ``max_degree`` -- friend-count range, inclusive
+        * ``community`` -- Louvain community id the user belongs to
+
+        ``total`` always reflects the *filtered* count.  Degree filtering needs
+        the graph, so it is loaded once and reused for every record.
+        """
         users = self.store.load_users()
+        required_tags = list(tags or [])
+        if tag and tag not in required_tags:
+            required_tags.append(tag)
+        required_set = {t for t in required_tags if t}
+        match_all = tag_match != "or"
+
+        graph = None
+        communities = None
+        if min_degree is not None or max_degree is not None:
+            graph = self.get_graph()
+        if community is not None or not ids_only:
+            # Louvain results come from JSON with str keys, from memory with
+            # int keys -- normalise so the filter/display is accurate either
+            # way.  Also powers the "社群" column of the user list.
+            raw = self.get_community().get("communities", {})
+            communities = {int(k): int(v) for k, v in raw.items()}
+
         items = []
         for uid, u in users.items():
             if search:
-                haystack = str(uid)
-                if search not in haystack:
+                if search not in str(u.get("name", "")) and search not in str(uid):
                     continue
-            if tag:
-                if tag not in u.get("tags", []):
+            user_tags = u.get("tags", [])
+            if required_set:
+                tag_set = set(user_tags)
+                if match_all:
+                    if not required_set.issubset(tag_set):
+                        continue
+                else:
+                    if not (required_set & tag_set):
+                        continue
+            degree = 0
+            need_degree = (
+                graph is not None
+                or min_degree is not None
+                or max_degree is not None
+                or not ids_only
+            )
+            if need_degree:
+                if graph is None:
+                    graph = self.get_graph()
+                degree = graph.degree(uid)
+                if min_degree is not None and degree < min_degree:
                     continue
+                if max_degree is not None and degree > max_degree:
+                    continue
+            if community is not None and communities.get(uid, -1) != community:
+                continue
+            if ids_only:
+                items.append({"id": uid})
+                continue
             record = {"id": uid}
             for key, value in u.items():
                 record[key] = value
+            # ``created_at`` is persisted as ``created_at_ms``; expose the
+            # canonical name so the configured sort field always exists.
+            if "created_at_ms" in record and "created_at" not in record:
+                record["created_at"] = record["created_at_ms"]
             record["uid"] = uid
+            if need_degree:
+                record["degree"] = degree
+            if communities is not None:
+                record["community"] = communities.get(uid, -1)
             items.append(record)
-        total = len(users)
+
+        total = len(items)
         sort_field = config.DEFAULT_USER_SORT
         items.sort(
             key=lambda x: (x.get(sort_field, 0), -x["id"]),
             reverse=True,
         )
+        if ids_only:
+            return {"items": items, "total": total, "page": page, "size": total}
+        if page < 1:
+            page = 1
         start = (page - 1) * size
-        if start < 0:
-            start = 0
-        end = start + size
-        page_out = items[start:end]
+        page_out = items[start:start + size]
         return {
             "items": page_out,
             "total": total,
@@ -217,51 +294,149 @@ class SocialGraphService:
         ]
 
     def create_user(self, name: str, tags: Optional[List[str]] = None, attributes: Optional[dict] = None) -> dict:
-        users = self.store.load_users()
-        uid = max(users.keys(), default=0) + 1
-        user = {
-            "name": name or f"user_{uid}",
-            "tags": tags or [],
-            "attributes": attributes or {},
-            "created_at": config.now_ms(),
-        }
-        users[uid] = user
-        self.store.save_users(users)
-        self._register_tags(tags or [])
-        return {"id": uid, **user}
+        with self._lock:
+            users = self.store.load_users()
+            uid = max(users.keys(), default=0) + 1
+            user = {
+                "name": name or f"user_{uid}",
+                "tags": tags or [],
+                "attributes": attributes or {},
+                "created_at": config.now_ms(),
+            }
+            users[uid] = user
+            self.store.save_users(users)
+            self._register_tags(tags or [])
+            return {"id": uid, **user}
 
     def update_user(self, uid: int, patch: dict) -> Optional[dict]:
-        users = self.store.load_users()
-        if uid not in users:
-            return None
-        u = users[uid]
-        if "name" in patch:
-            u["name"] = patch["name"]
-        if "tags" in patch:
-            u["tags"] = patch["tags"]
-            self._register_tags(patch["tags"])
-        if "attributes" in patch:
-            u["attributes"] = {**u.get("attributes", {}), **patch["attributes"]}
-        self.store.save_users(users)
-        # Invalidate recommendations since tags may change recommendations.
-        self._rec_cache.pop(uid, None)
-        return {"id": uid, **u}
+        with self._lock:
+            users = self.store.load_users()
+            if uid not in users:
+                return None
+            u = users[uid]
+            if "name" in patch:
+                u["name"] = patch["name"]
+            if "tags" in patch:
+                u["tags"] = patch["tags"]
+                self._register_tags(patch["tags"])
+            if "attributes" in patch:
+                u["attributes"] = {**u.get("attributes", {}), **patch["attributes"]}
+            self.store.save_users(users)
+            # Invalidate recommendations since tags may change recommendations.
+            self._rec_cache.pop(uid, None)
+            return {"id": uid, **u}
 
     def delete_user(self, uid: int) -> bool:
-        users = self.store.load_users()
-        if uid not in users:
-            return False
-        del users[uid]
-        self.store.save_users(users)
-        # Remove incident edges: rebuild graph without this node.
-        edges = [
-            (u, v, w)
-            for u, v, w in self.store.iter_all_edges()
-            if u != uid and v != uid
-        ]
-        self._rewrite_all_edges(edges)
-        self._rec_cache.pop(uid, None)
-        return True
+        with self._lock:
+            users = self.store.load_users()
+            if uid not in users:
+                return False
+            del users[uid]
+            self.store.save_users(users)
+            # Remove incident edges: rebuild graph without this node.
+            edges = [
+                (u, v, w)
+                for u, v, w in self.store.iter_all_edges()
+                if u != uid and v != uid
+            ]
+            self._rewrite_all_edges(edges)
+            self._rec_cache.pop(uid, None)
+            return True
+
+    # ------------------------------------------------------------------
+    # Batch user operations (atomic: validate all, then write once)
+    # ------------------------------------------------------------------
+    BATCH_TAG_OPS = {"tags_add", "tags_remove", "tags_set"}
+    BATCH_OPS = BATCH_TAG_OPS | {"attributes_set", "delete"}
+
+    def batch_update_users(self, ids: List[int], operation: str, payload: Optional[dict] = None) -> dict:
+        """Apply one batch operation to many users atomically.
+
+        ``operation`` is one of:
+
+        * ``tags_add``      -- union each user's tags with ``payload['tags']``
+        * ``tags_remove``   -- drop ``payload['tags']`` from each user
+        * ``tags_set``      -- replace every user's tag list
+        * ``attributes_set``-- merge ``payload['attributes']`` into each user
+        * ``delete``        -- delete users and every edge touching them
+
+        All inputs are validated before any file is touched, so an unknown id
+        or a malformed payload aborts the whole request -- there is no partial
+        application.  Persistence is a single atomic users-file write plus, for
+        deletes, a single canonical graph rewrite.
+        """
+        payload = payload or {}
+        if operation not in self.BATCH_OPS:
+            raise ValueError(f"不支持的批量操作: {operation}")
+        if not isinstance(ids, list) or not ids:
+            raise ValueError("ids 必须是非空列表")
+        try:
+            id_list = [int(x) for x in ids]
+        except (TypeError, ValueError):
+            raise ValueError("ids 必须全部是整数用户 ID")
+        if len(set(id_list)) != len(id_list):
+            raise ValueError("ids 中存在重复项")
+
+        tag_values: List[str] = []
+        attr_values: Optional[dict] = None
+        if operation in self.BATCH_TAG_OPS:
+            raw_tags = payload.get("tags", [])
+            if not isinstance(raw_tags, list):
+                raise ValueError("tags 必须是列表")
+            tag_values = [str(t).strip() for t in raw_tags if str(t).strip()]
+            if not tag_values:
+                raise ValueError("标签不能为空")
+        elif operation == "attributes_set":
+            attr_values = payload.get("attributes", {})
+            if not isinstance(attr_values, dict) or not attr_values:
+                raise ValueError("attributes 必须是非空对象")
+
+        with self._lock:
+            users = self.store.load_users()
+            missing = [i for i in id_list if i not in users]
+            if missing:
+                raise ValueError(f"用户不存在: {', '.join(str(i) for i in missing[:10])}")
+
+            new_tags: Set[str] = set()
+            if operation == "delete":
+                delete_set = set(id_list)
+                # Rewrite the graph once, dropping every incident edge.
+                edges = [
+                    (u, v, w)
+                    for u, v, w in self.store.iter_all_edges()
+                    if u not in delete_set and v not in delete_set
+                ]
+                for uid in id_list:
+                    del users[uid]
+                    self._rec_cache.pop(uid, None)
+                self.store.save_users(users)
+                self._rewrite_all_edges(edges)
+            else:
+                tag_set = set(tag_values)
+                for uid in id_list:
+                    u = users[uid]
+                    if operation == "tags_add":
+                        existing = list(u.get("tags", []))
+                        merged = existing + [t for t in tag_values if t not in existing]
+                        u["tags"] = merged
+                        new_tags.update(tag_set)
+                    elif operation == "tags_remove":
+                        u["tags"] = [t for t in u.get("tags", []) if t not in tag_set]
+                    elif operation == "tags_set":
+                        u["tags"] = list(tag_values)
+                        new_tags.update(tag_set)
+                    elif operation == "attributes_set":
+                        u["attributes"] = {**u.get("attributes", {}), **attr_values}
+                    self._rec_cache.pop(uid, None)
+                self.store.save_users(users)
+                if new_tags:
+                    self._register_tags(sorted(new_tags))
+
+            return {
+                "operation": operation,
+                "affected": len(id_list),
+                "ids": id_list,
+            }
 
     def _rewrite_all_edges(self, edges) -> None:
         """Rewrites the entire graph from a list of edges (used by delete)."""

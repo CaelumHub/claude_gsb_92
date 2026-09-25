@@ -63,6 +63,10 @@
     updateUser: (id, b) => request("PUT", "/api/users/" + id, b),
     deleteUser: (id) => request("DELETE", "/api/users/" + id),
     setUserTags: (id, tags) => request("POST", "/api/users/" + id + "/tags", { tags }),
+    // 批量操作（服务端一次原子完成）：
+    // operation: tags_add | tags_remove | tags_set | attributes_set | delete
+    batchUsers: (ids, operation, payload) =>
+      request("POST", "/api/users/batch", { ids, operation, payload: payload || {} }),
 
     // 关系导入
     importEdges: (edges, source) => request("POST", "/api/import", { edges, source }),

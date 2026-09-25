@@ -125,7 +125,8 @@ gsb3/
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/api/health` | 健康检查 |
-| GET/POST | `/api/users` | 用户列表（分页/搜索/标签过滤）/ 创建 |
+| GET/POST | `/api/users` | 用户列表（分页/搜索/组合筛选）/ 创建 |
+| POST | `/api/users/batch` | 批量打标签/设属性/删除（原子生效） |
 | GET/PUT/DELETE | `/api/users/<id>` | 用户详情 / 更新 / 删除 |
 | POST | `/api/users/<id>/tags` | 设置用户标签 |
 | POST | `/api/import` | 批量导入边 |
@@ -140,6 +141,32 @@ gsb3/
 | GET | `/api/export?format=json\|graphml\|csv` | 导出 |
 | POST | `/api/graph/rebuild-index` · `/api/graph/merge` | 索引重建 / 分片合并 |
 | POST | `/api/seed` | 生成演示数据 |
+
+### 用户组合筛选与批量操作
+
+`GET /api/users` 在原 `page/size/search/tag` 基础上支持组合筛选（条件之间为 AND）：
+
+| 参数 | 说明 |
+| --- | --- |
+| `tags` | 多个标签，逗号分隔（如 `tags=科技,美食`）；兼容旧的单值 `tag` |
+| `tag_match` | `and`（同时命中全部标签，默认）/ `or`（任一命中） |
+| `min_degree` / `max_degree` | 好友数范围，闭区间 |
+| `community` | 所属 Louvain 社群 id |
+| `ids_only=1` | 仅返回命中用户 id（供「选择全部筛选结果」等场景，传输最小化） |
+
+返回的 `total` 始终是**筛选后**的命中数，列表项附带 `degree` 与 `community`。
+
+`POST /api/users/batch` 在服务端一次性、原子地完成批量修改：
+
+```json
+{ "ids": [12, 18, 121], "operation": "tags_add", "payload": {"tags": ["VIP"]} }
+```
+
+`operation` 取值：`tags_add`（追加并集）/ `tags_remove`（移除）/ `tags_set`（覆盖）/
+`attributes_set`（合并写入属性）/ `delete`（删除用户及其全部关联边）。服务端先校验全部
+id 与载荷，任一不合法即整体 400 拒绝、不产生部分写入；合法时在同一把写锁内单次落盘，
+保证跨用户结果一致。前端（`users.html`）负责跨页多选与二次确认，操作后立即重拉列表、
+总数、标签与社群选项。
 
 ---
 

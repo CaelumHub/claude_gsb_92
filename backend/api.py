@@ -12,8 +12,10 @@ are parsed once and passed through.  Static files are served from
 Endpoint summary (all under ``/api``):
 
     GET    /api/health
-    GET    /api/users                 ?page&size&search&tag
+    GET    /api/users                 ?page&size&search&tag&tags&tag_match
+                                      &min_degree&max_degree&community&ids_only
     POST   /api/users                 {name, tags, attributes}
+    POST   /api/users/batch           {ids:[...], operation, payload}  atomic
     GET    /api/users/<id>
     PUT    /api/users/<id>            {name?, tags?, attributes?}
     DELETE /api/users/<id>
@@ -91,6 +93,23 @@ def _to_bool(value: Optional[str], default: bool = False) -> bool:
     return value.lower() in ("1", "true", "yes", "on")
 
 
+def _to_optional_int(value: Optional[str]) -> Optional[int]:
+    """Parse an optional query int; empty string means "filter not set"."""
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_list_param(value: Optional[str]) -> list:
+    """Parse a comma-separated list query param into trimmed, non-empty items."""
+    if not value:
+        return []
+    return [part.strip() for part in value.split(",") if part.strip()]
+
+
 class ApiRouter:
     """Routes an (method, path, body) request to a handler."""
 
@@ -113,12 +132,28 @@ class ApiRouter:
 
         # --- users collection ---
         if route == "/users" and method == "GET":
-            page = _to_int(query.get("page"), 0)
+            page = max(_to_int(query.get("page"), 1), 1)
             size = min(max(_to_int(query.get("size"), 20), 1), 500)
+            # Repeated ``tags=a&tags=b`` and comma-separated ``tags=a,b`` are
+            # both accepted, so the multi-tag filter is bookmarkable.
+            tags = _parse_list_param(query.get("tags"))
+            tag_match = query.get("tag_match", "and")
+            if tag_match not in ("and", "or"):
+                tag_match = "and"
+            min_degree = _to_optional_int(query.get("min_degree"))
+            max_degree = _to_optional_int(query.get("max_degree"))
+            community = _to_optional_int(query.get("community"))
+            ids_only = _to_bool(query.get("ids_only"), False)
             return 200, self.service.list_users(
                 page=page, size=size,
                 search=query.get("search", ""),
                 tag=query.get("tag", ""),
+                tags=tags,
+                tag_match=tag_match,
+                min_degree=min_degree,
+                max_degree=max_degree,
+                community=community,
+                ids_only=ids_only,
             )
         if route == "/users" and method == "POST":
             b = body or {}
@@ -127,6 +162,18 @@ class ApiRouter:
             attributes = b.get("attributes") or {}
             user = self.service.create_user(name, tags, attributes)
             return 201, user
+
+        # --- batch user operations (atomic server-side) ---
+        if route == "/users/batch" and method == "POST":
+            b = body or {}
+            operation = str(b.get("operation", ""))
+            try:
+                result = self.service.batch_update_users(
+                    b.get("ids") or [], operation, b.get("payload") or {}
+                )
+            except ValueError as exc:
+                return _error(str(exc), 400)
+            return 200, result
 
         # --- single user ---
         m = re.fullmatch(r"/users/(\d+)", route)
@@ -553,13 +600,16 @@ class SocialGraphHandler(BaseHTTPRequestHandler):
             super().log_message(fmt, *args)
 
 
-def create_server(service: SocialGraphService, host: str = config.HOST, port: int = config.PORT):
+def create_server(service: SocialGraphService, host: Optional[str] = None, port: Optional[int] = None):
+    # Read config at call time (not as default arguments): run.py may override
+    # config.HOST/PORT *after* this module was imported, and default args are
+    # bound once at function-definition time.
     handler = type(
         "BoundHandler",
         (SocialGraphHandler,),
         {"router": ApiRouter(service)},
     )
-    return ThreadingHTTPServer((host, port), handler)
+    return ThreadingHTTPServer((host or config.HOST, port if port is not None else config.PORT), handler)
 
 
 def run(service: SocialGraphService) -> None:
